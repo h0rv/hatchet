@@ -14,7 +14,6 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/random"
 )
 
-// StoredKeys represents the encryption keys stored on disk
 type StoredKeys struct {
 	MasterKey     string `json:"master_key"`
 	PrivateJWT    string `json:"private_jwt"`
@@ -22,16 +21,13 @@ type StoredKeys struct {
 	CookieSecrets string `json:"cookie_secrets"`
 }
 
-// ensureEncryptionKeys loads existing keys or generates new ones
 func (d *LocalDriver) ensureEncryptionKeys() error {
 	keysPath := filepath.Join(d.configDir, KeysFileName)
 
-	// Try to load existing keys
 	if fileExists(keysPath) {
 		return d.loadKeys(keysPath)
 	}
 
-	// Generate new keys
 	masterKey, privateJWT, publicJWT, err := encryption.GenerateLocalKeys()
 	if err != nil {
 		return fmt.Errorf("failed to generate encryption keys: %w", err)
@@ -41,18 +37,15 @@ func (d *LocalDriver) ensureEncryptionKeys() error {
 	d.privateJWT = string(privateJWT)
 	d.publicJWT = string(publicJWT)
 
-	// Generate cookie secrets
 	cookieSecrets, err := generateCookieSecrets()
 	if err != nil {
 		return fmt.Errorf("failed to generate cookie secrets: %w", err)
 	}
 	d.cookieSecrets = cookieSecrets
 
-	// Save keys for future use
 	return d.saveKeys(keysPath)
 }
 
-// loadKeys loads encryption keys from disk
 func (d *LocalDriver) loadKeys(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -72,7 +65,6 @@ func (d *LocalDriver) loadKeys(path string) error {
 	return nil
 }
 
-// saveKeys saves encryption keys to disk
 func (d *LocalDriver) saveKeys(path string) error {
 	keys := StoredKeys{
 		MasterKey:     d.masterKey,
@@ -89,7 +81,6 @@ func (d *LocalDriver) saveKeys(path string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-// generateCookieSecrets generates cookie hash and block keys
 func generateCookieSecrets() (string, error) {
 	hashKey, err := random.Generate(16)
 	if err != nil {
@@ -104,22 +95,16 @@ func generateCookieSecrets() (string, error) {
 	return fmt.Sprintf("%s %s", hashKey, blockKey), nil
 }
 
-// writeConfigFiles writes the database.yaml and server.yaml config files
 func (d *LocalDriver) writeConfigFiles() error {
-	// Write database.yaml
 	if err := d.writeDatabaseConfig(); err != nil {
 		return fmt.Errorf("failed to write database config: %w", err)
 	}
-
-	// Write server.yaml
 	if err := d.writeServerConfig(); err != nil {
 		return fmt.Errorf("failed to write server config: %w", err)
 	}
-
 	return nil
 }
 
-// writeDatabaseConfig writes the database.yaml config file
 func (d *LocalDriver) writeDatabaseConfig() error {
 	config := &database.ConfigFile{
 		Seed: database.SeedConfigFile{
@@ -128,7 +113,7 @@ func (d *LocalDriver) writeDatabaseConfig() error {
 			AdminName:         "Admin",
 			DefaultTenantName: "Default",
 			DefaultTenantSlug: "default",
-			DefaultTenantID:   DefaultTenantID, // Use constant defined in local.go
+			DefaultTenantID:   DefaultTenantID,
 		},
 	}
 
@@ -141,7 +126,6 @@ func (d *LocalDriver) writeDatabaseConfig() error {
 	return os.WriteFile(configPath, data, 0600)
 }
 
-// writeServerConfig writes the server.yaml config file
 func (d *LocalDriver) writeServerConfig() error {
 	config := &server.ServerConfigFile{
 		Auth: server.ConfigFileAuth{
@@ -192,7 +176,6 @@ func (d *LocalDriver) writeServerConfig() error {
 	return os.WriteFile(configPath, data, 0600)
 }
 
-// fileExists checks if a file exists
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil

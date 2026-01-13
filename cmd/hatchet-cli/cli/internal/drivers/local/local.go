@@ -142,43 +142,35 @@ func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, er
 	d.healthcheckPort = options.HealthcheckPort
 	d.profileName = options.ProfileName
 
-	// 1. Ensure database exists and is configured correctly
 	if err := d.ensureDatabase(ctx); err != nil {
 		return nil, fmt.Errorf("database setup failed: %w", err)
 	}
 
-	// 2. Initialize config directory
 	if err := d.initConfigDir(); err != nil {
 		return nil, fmt.Errorf("failed to initialize config directory: %w", err)
 	}
 
-	// 3. Generate or load encryption keys
 	if err := d.ensureEncryptionKeys(); err != nil {
 		return nil, fmt.Errorf("failed to setup encryption keys: %w", err)
 	}
 
-	// 4. Write config files
 	if err := d.writeConfigFiles(); err != nil {
 		return nil, fmt.Errorf("failed to write config files: %w", err)
 	}
 
-	// 5. Run migrations
 	if err := d.runMigrations(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
 
-	// 6. Seed database (idempotent)
 	if err := d.seedDatabase(); err != nil {
 		return nil, fmt.Errorf("failed to seed database: %w", err)
 	}
 
-	// 7. Generate API token before starting server
 	token, err := d.generateToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate API token: %w", err)
 	}
 
-	// 8. Save state for stop command (PID of this process)
 	if err := d.saveState(); err != nil {
 		return nil, fmt.Errorf("failed to save state: %w", err)
 	}
@@ -191,20 +183,15 @@ func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, er
 	}, nil
 }
 
-// StartServer starts the API and engine in-process and blocks until interrupted
-// This should be called after Run() to actually start the server
+// StartServer starts the API and engine in-process and blocks until interrupted.
+// This should be called after Run() to actually start the server.
 func (d *LocalDriver) StartServer(ctx context.Context, interruptCh <-chan interface{}, onReady func()) error {
-	// Set environment variables for the server
 	d.setEnvVars()
-
-	// Create config loader
 	cf := loader.NewConfigLoader(d.configDir)
 
-	// Track errors from goroutines
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
-	// Start API in goroutine
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -214,7 +201,6 @@ func (d *LocalDriver) StartServer(ctx context.Context, interruptCh <-chan interf
 		}
 	}()
 
-	// Start Engine in goroutine
 	engineCtx, engineCancel := context.WithCancel(ctx)
 	defer engineCancel()
 
@@ -227,29 +213,23 @@ func (d *LocalDriver) StartServer(ctx context.Context, interruptCh <-chan interf
 		}
 	}()
 
-	// Wait for API to be ready
 	if err := d.waitForHealth(ctx); err != nil {
 		return fmt.Errorf("server failed to become healthy: %w", err)
 	}
 
-	// Signal that server is ready
 	if onReady != nil {
 		onReady()
 	}
 
-	// Wait for interrupt or error
 	select {
 	case <-interruptCh:
-		// Clean shutdown initiated
 		log.Println("cleaning up server config")
 	case err := <-errCh:
 		return err
 	}
 
-	// Cancel engine context to trigger shutdown
 	engineCancel()
 
-	// Wait for all goroutines to finish (with timeout)
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -258,12 +238,10 @@ func (d *LocalDriver) StartServer(ctx context.Context, interruptCh <-chan interf
 
 	select {
 	case <-done:
-		// Clean exit
 	case <-time.After(10 * time.Second):
 		log.Println("shutdown timeout, some goroutines may not have exited cleanly")
 	}
 
-	// Clean up state file
 	d.removeState()
 
 	return nil
@@ -277,34 +255,29 @@ type RunResult struct {
 	GRPCPort    int
 }
 
-// Stop stops the local Hatchet server
 func (d *LocalDriver) Stop() error {
 	state, err := d.loadState()
 	if err != nil {
 		return fmt.Errorf("no local server running or state file not found: %w", err)
 	}
 
-	// Send SIGTERM to the process
 	if state.PID > 0 {
 		if err := killProcessByPID(state.PID); err != nil {
 			return fmt.Errorf("failed to stop server (PID %d): %w", state.PID, err)
 		}
 	}
 
-	// Remove state file
 	d.removeState()
 
 	return nil
 }
 
-// IsRunning checks if a local server is currently running
 func (d *LocalDriver) IsRunning() bool {
 	state, err := d.loadState()
 	if err != nil {
 		return false
 	}
 
-	// Check if process is actually running
 	if state.PID > 0 {
 		if process, err := os.FindProcess(state.PID); err == nil {
 			if err := process.Signal(syscall.Signal(0)); err == nil {
@@ -316,9 +289,7 @@ func (d *LocalDriver) IsRunning() bool {
 	return false
 }
 
-// ensureDatabase creates the database if needed and configures timezone
 func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
-	// Parse the database URL to extract database name
 	parsedURL, err := url.Parse(d.databaseURL)
 	if err != nil {
 		return fmt.Errorf("invalid database URL: %w", err)
@@ -329,27 +300,20 @@ func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
 		dbName = "hatchet"
 	}
 
-	// Validate database name to prevent SQL injection
-	// Only allow alphanumeric characters and underscores
 	if !isValidIdentifier(dbName) {
 		return fmt.Errorf("invalid database name: %s (only alphanumeric and underscores allowed)", dbName)
 	}
 
-	// Build connection URL for the default 'postgres' database
-	// Preserve query params (like sslmode) from original URL
 	adminURL := *parsedURL
 	adminURL.Path = "/postgres"
 	adminConnStr := adminURL.String()
 
-	// Try to connect to the target database first
 	conn, err := pgx.Connect(ctx, d.databaseURL)
 	if err == nil {
-		// Database exists, just ensure timezone is set
 		conn.Close(ctx)
 		return d.ensureTimezone(ctx, dbName, adminConnStr)
 	}
 
-	// Database might not exist, try to create it
 	log.Printf("Creating database '%s'...", dbName)
 
 	adminConn, err := pgx.Connect(ctx, adminConnStr)
@@ -358,21 +322,16 @@ func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
 	}
 	defer adminConn.Close(ctx)
 
-	// Create database (ignore error if it already exists)
-	// Using quoted identifier to safely handle the database name
 	_, err = adminConn.Exec(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, dbName))
 	if err != nil {
-		// Check if error is "database already exists" - that's fine
 		if !strings.Contains(err.Error(), "already exists") {
 			return fmt.Errorf("could not create database: %w", err)
 		}
 	}
 
-	// Set timezone to UTC
 	return d.ensureTimezone(ctx, dbName, adminConnStr)
 }
 
-// ensureTimezone sets the database timezone to UTC
 func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr string) error {
 	adminConn, err := pgx.Connect(ctx, adminConnStr)
 	if err != nil {
@@ -380,14 +339,11 @@ func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr s
 	}
 	defer adminConn.Close(ctx)
 
-	// Set timezone to UTC (required by Hatchet)
-	// Using quoted identifier to safely handle the database name
 	_, err = adminConn.Exec(ctx, fmt.Sprintf(`ALTER DATABASE "%s" SET TIMEZONE='UTC'`, dbName))
 	if err != nil {
 		return fmt.Errorf("could not set timezone: %w", err)
 	}
 
-	// Verify we can connect to the target database
 	conn, err := pgx.Connect(ctx, d.databaseURL)
 	if err != nil {
 		return fmt.Errorf("could not connect to database: %w", err)
@@ -397,15 +353,13 @@ func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr s
 	return conn.Ping(ctx)
 }
 
-// isValidIdentifier checks if a string is a valid PostgreSQL identifier
-// Only allows alphanumeric characters and underscores
 func isValidIdentifier(s string) bool {
 	if len(s) == 0 || len(s) > 63 {
 		return false
 	}
 	for i, c := range s {
 		if i == 0 && c >= '0' && c <= '9' {
-			return false // Can't start with a digit
+			return false
 		}
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
 			return false
@@ -414,23 +368,17 @@ func isValidIdentifier(s string) bool {
 	return true
 }
 
-// initConfigDir creates the config directory if it doesn't exist
 func (d *LocalDriver) initConfigDir() error {
 	return os.MkdirAll(d.configDir, 0700)
 }
 
-// runMigrations runs database migrations
 func (d *LocalDriver) runMigrations(ctx context.Context) error {
-	// Set DATABASE_URL for the migrate package
 	os.Setenv("DATABASE_URL", d.databaseURL)
-
-	// Run migrations - this is safe to call multiple times
 	migrate.RunMigrations(ctx)
 
 	return nil
 }
 
-// seedDatabase seeds the database with initial data
 func (d *LocalDriver) seedDatabase() error {
 	configLoader := loader.NewConfigLoader(d.configDir)
 
@@ -440,12 +388,9 @@ func (d *LocalDriver) seedDatabase() error {
 	}
 	defer dbLayer.Disconnect() // nolint: errcheck
 
-	// Check if already seeded by looking for admin user
-	// seed.SeedDatabase handles this internally
 	return seed.SeedDatabase(dbLayer)
 }
 
-// generateToken generates an API token for the local profile
 func (d *LocalDriver) generateToken(ctx context.Context) (string, error) {
 	configLoader := loader.NewConfigLoader(d.configDir)
 
@@ -460,10 +405,8 @@ func (d *LocalDriver) generateToken(ctx context.Context) (string, error) {
 	}
 	defer cleanup() // nolint: errcheck
 
-	// Use default tenant ID from seed
-	tenantID := "707d0855-80ab-4e1f-a156-f1c4546cbf52"
-
-	expiresAt := time.Now().UTC().Add(365 * 24 * time.Hour) // 1 year
+	tenantID := DefaultTenantID
+	expiresAt := time.Now().UTC().Add(365 * 24 * time.Hour)
 
 	token, err := serverConfig.Auth.JWTManager.GenerateTenantToken(
 		ctx,
@@ -479,7 +422,6 @@ func (d *LocalDriver) generateToken(ctx context.Context) (string, error) {
 	return token.Token, nil
 }
 
-// setEnvVars sets environment variables for the in-process server
 func (d *LocalDriver) setEnvVars() {
 	os.Setenv("DATABASE_URL", d.databaseURL)
 	os.Setenv("SERVER_AUTH_COOKIE_DOMAIN", "localhost")
@@ -500,11 +442,8 @@ func (d *LocalDriver) setEnvVars() {
 	os.Setenv("SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS", fmt.Sprintf("localhost:%d", d.grpcPort))
 }
 
-// waitForHealth waits for the API server to become healthy
 func (d *LocalDriver) waitForHealth(ctx context.Context) error {
 	healthURL := fmt.Sprintf("http://localhost:%d/api/ready", d.apiPort)
-
-	// Create a context with timeout for the entire health check operation
 	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -521,7 +460,6 @@ func (d *LocalDriver) waitForHealth(ctx context.Context) error {
 			}
 			return fmt.Errorf("timeout waiting for server to become healthy")
 		case <-ticker.C:
-			// Use context-aware request to properly cancel on shutdown
 			req, err := http.NewRequestWithContext(healthCtx, "GET", healthURL, nil)
 			if err != nil {
 				continue
@@ -537,12 +475,11 @@ func (d *LocalDriver) waitForHealth(ctx context.Context) error {
 	}
 }
 
-// saveState saves the current server state to disk
 func (d *LocalDriver) saveState() error {
 	state := LocalServerState{
 		ConfigDir:   d.configDir,
 		DatabaseURL: d.databaseURL,
-		PID:         os.Getpid(), // Current process PID (in-process server)
+		PID:         os.Getpid(),
 		ApiPort:     d.apiPort,
 		GrpcPort:    d.grpcPort,
 		ProfileName: d.profileName,
@@ -558,7 +495,6 @@ func (d *LocalDriver) saveState() error {
 	return os.WriteFile(stateFile, data, 0600)
 }
 
-// loadState loads the server state from disk
 func (d *LocalDriver) loadState() (*LocalServerState, error) {
 	stateFile := filepath.Join(d.configDir, StateFileName)
 
@@ -575,7 +511,6 @@ func (d *LocalDriver) loadState() (*LocalServerState, error) {
 	return &state, nil
 }
 
-// removeState removes the state file
 func (d *LocalDriver) removeState() {
 	stateFile := filepath.Join(d.configDir, StateFileName)
 	if err := os.Remove(stateFile); err != nil && !os.IsNotExist(err) {
@@ -583,23 +518,19 @@ func (d *LocalDriver) removeState() {
 	}
 }
 
-// killProcessByPID kills a process by PID with graceful shutdown
 func killProcessByPID(pid int) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return err
 	}
 
-	// Try SIGTERM first
 	if err := process.Signal(syscall.SIGTERM); err != nil {
-		// Process might already be dead
 		if err == os.ErrProcessDone {
 			return nil
 		}
 		return err
 	}
 
-	// Wait up to 5 seconds for graceful shutdown
 	done := make(chan error, 1)
 	go func() {
 		_, err := process.Wait()
@@ -610,32 +541,26 @@ func killProcessByPID(pid int) error {
 	case <-done:
 		return nil
 	case <-time.After(5 * time.Second):
-		// Force kill
 		return process.Kill()
 	}
 }
 
-// GetConfigDir returns the config directory path
 func (d *LocalDriver) GetConfigDir() string {
 	return d.configDir
 }
 
-// GetStateFilePath returns the state file path
 func GetStateFilePath() string {
 	homeDir, _ := os.UserHomeDir()
 	return filepath.Join(homeDir, ".hatchet", "local", StateFileName)
 }
 
-// IsLocalServerRunning checks if a local server is running by checking the state file
 func IsLocalServerRunning() bool {
 	driver := NewLocalDriver()
 	return driver.IsRunning()
 }
 
-// DefaultTenantID is the tenant ID created by the seed
 const DefaultTenantID = "707d0855-80ab-4e1f-a156-f1c4546cbf52"
 
-// CreateProfileFromResult creates a CLI profile from the run result
 func CreateProfileFromResult(result *RunResult) (*cliconfig.Profile, error) {
 	return &cliconfig.Profile{
 		Name:         result.ProfileName,
@@ -644,6 +569,6 @@ func CreateProfileFromResult(result *RunResult) (*cliconfig.Profile, error) {
 		ApiServerURL: fmt.Sprintf("http://localhost:%d", result.APIPort),
 		GrpcHostPort: fmt.Sprintf("localhost:%d", result.GRPCPort),
 		TLSStrategy:  "none",
-		ExpiresAt:    time.Now().Add(365 * 24 * time.Hour), // 1 year
+		ExpiresAt:    time.Now().Add(365 * 24 * time.Hour),
 	}, nil
 }
