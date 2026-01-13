@@ -8,6 +8,7 @@ import (
 
 	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/config/cli"
 	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/drivers/docker"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/drivers/local"
 	"github.com/hatchet-dev/hatchet/cmd/hatchet-cli/cli/internal/styles"
 )
 
@@ -19,48 +20,88 @@ var serverCmd = &cobra.Command{
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start a local Hatchet server using Docker",
-	Long:  `Start a local Hatchet server environment using Docker containers. This command will start both a PostgreSQL database and a Hatchet server instance, automatically creating a local profile for easy access.`,
-	Example: `  # Start server with default settings (port 8888)
+	Short: "Start a local Hatchet server",
+	Long: `Start a local Hatchet server environment. By default, uses Docker containers.
+Use --local to run without Docker (requires local PostgreSQL and hatchet-api/hatchet-engine binaries).`,
+	Example: `  # Start server with Docker (default)
   hatchet server start
 
-  # Start server with custom dashboard port
-  hatchet server start --dashboard-port 9000
+  # Start server without Docker (headless, local binaries)
+  hatchet server start --local
 
-  # Start server with custom ports and project name
-  hatchet server start --dashboard-port 9000 --grpc-port 8077 --project-name my-hatchet
+  # Start local server with custom database
+  hatchet server start --local --database-url "postgresql://user:pass@localhost:5432/hatchet"
+
+  # Start Docker server with custom dashboard port
+  hatchet server start --dashboard-port 9000
 
   # Start server with custom profile name
   hatchet server start --profile my-local`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Get flag values
-		dashboardPort, _ := cmd.Flags().GetInt("dashboard-port")
-		grpcPort, _ := cmd.Flags().GetInt("grpc-port")
-		projectName, _ := cmd.Flags().GetString("project-name")
+		// Check if --local flag is set
+		localMode, _ := cmd.Flags().GetBool("local")
 		profileName, _ := cmd.Flags().GetString("profile")
 
-		result, err := startLocalServer(cmd, profileName, dashboardPort, grpcPort, projectName)
-		if err != nil {
-			cli.Logger.Fatalf("%v", err)
-		}
+		if localMode {
+			// Local mode (no Docker)
+			result, err := startLocalServerNative(cmd, profileName)
+			if err != nil {
+				cli.Logger.Fatalf("%v", err)
+			}
 
-		// Render styled output
-		fmt.Println(serverStartedView(result.ProfileName, result.DashboardPort, result.GrpcPort, ""))
+			// Render styled output for local mode
+			fmt.Println(localServerStartedView(result.ProfileName, result.APIPort, result.GRPCPort))
+		} else {
+			// Docker mode (default)
+			dashboardPort, _ := cmd.Flags().GetInt("dashboard-port")
+			grpcPort, _ := cmd.Flags().GetInt("grpc-port")
+			projectName, _ := cmd.Flags().GetString("project-name")
+
+			result, err := startLocalServer(cmd, profileName, dashboardPort, grpcPort, projectName)
+			if err != nil {
+				cli.Logger.Fatalf("%v", err)
+			}
+
+			// Render styled output
+			fmt.Println(serverStartedView(result.ProfileName, result.DashboardPort, result.GrpcPort, ""))
+		}
 	},
 }
 
 var stopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop a local Hatchet server started with 'hatchet server start'",
-	Long:  `Stop a local Hatchet server environment that was started using Docker containers with the 'hatchet server start' command.`,
-	Example: `  # Stop the local Hatchet server
+	Long: `Stop a local Hatchet server environment. Auto-detects whether the server
+was started with Docker or --local mode and stops it appropriately.`,
+	Example: `  # Stop the local Hatchet server (auto-detects mode)
   hatchet server stop
 
-  # Stop the local Hatchet server with a custom project name
-  hatchet server stop --project-name my-hatchet`,
-	Run: func(cmd *cobra.Command, args []string) {
-		dockerDriver, err := docker.NewDockerDriver(cmd.Context())
+  # Stop a Docker server with a custom project name
+  hatchet server stop --project-name my-hatchet
 
+  # Explicitly stop a local (non-Docker) server
+  hatchet server stop --local`,
+	Run: func(cmd *cobra.Command, args []string) {
+		localMode, _ := cmd.Flags().GetBool("local")
+
+		// Auto-detect: check if local server is running
+		if !localMode && local.IsLocalServerRunning() {
+			localMode = true
+		}
+
+		if localMode {
+			// Stop local server
+			localDriver := local.NewLocalDriver()
+			err := localDriver.Stop()
+			if err != nil {
+				cli.Logger.Fatalf("could not stop local server: %v\n", err)
+			}
+			fmt.Println(styles.SuccessBox.Render("Local Hatchet server stopped successfully!"))
+			return
+		}
+
+		// Docker mode
+		dockerDriver, err := docker.NewDockerDriver(cmd.Context())
 		if err != nil {
 			cli.Logger.Fatalf("Docker is required to run this command. Please ensure Docker is installed and running.\nError: %v\n", err)
 		}
@@ -150,7 +191,7 @@ func startLocalServer(cmd *cobra.Command, profileName string, dashboardPort, grp
 	}, nil
 }
 
-// serverStartedView renders the server started message
+// serverStartedView renders the server started message for Docker mode
 func serverStartedView(profileName string, dashboardPort, grpcPort int, additionalMessage string) string {
 	var lines []string
 
@@ -171,17 +212,96 @@ func serverStartedView(profileName string, dashboardPort, grpcPort int, addition
 	return styles.SuccessBox.Render(strings.Join(lines, "\n"))
 }
 
+// startLocalServerNative starts a local Hatchet server without Docker
+func startLocalServerNative(cmd *cobra.Command, profileName string) (*local.RunResult, error) {
+	databaseURL, _ := cmd.Flags().GetString("database-url")
+	apiPort, _ := cmd.Flags().GetInt("api-port")
+	grpcPort, _ := cmd.Flags().GetInt("grpc-port")
+	healthcheckPort, _ := cmd.Flags().GetInt("healthcheck-port")
+
+	localDriver := local.NewLocalDriver()
+
+	// Build options
+	opts := []local.LocalOpt{
+		local.WithProfileName(profileName),
+	}
+
+	if databaseURL != "" {
+		opts = append(opts, local.WithDatabaseURL(databaseURL))
+	}
+
+	if apiPort != 0 {
+		opts = append(opts, local.WithAPIPort(apiPort))
+	}
+
+	if grpcPort != 0 {
+		opts = append(opts, local.WithGRPCPort(grpcPort))
+	}
+
+	if healthcheckPort != 0 {
+		opts = append(opts, local.WithHealthcheckPort(healthcheckPort))
+	}
+
+	result, err := localDriver.Run(cmd.Context(), opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create profile from the result
+	profile, err := local.CreateProfileFromResult(result)
+	if err != nil {
+		return nil, fmt.Errorf("could not create profile: %w", err)
+	}
+
+	err = cli.AddProfile(profileName, profile)
+	if err != nil {
+		return nil, fmt.Errorf("could not add profile: %w", err)
+	}
+
+	return result, nil
+}
+
+// localServerStartedView renders the server started message for local mode
+func localServerStartedView(profileName string, apiPort, grpcPort int) string {
+	var lines []string
+
+	lines = append(lines, styles.SuccessMessage("Local Hatchet server started successfully!"))
+	lines = append(lines, "")
+	lines = append(lines, styles.KeyValue("Mode", "Local (headless, no Docker)"))
+	lines = append(lines, styles.KeyValue("Profile", profileName))
+	lines = append(lines, styles.KeyValue("API Port", fmt.Sprintf("%d", apiPort)))
+	lines = append(lines, styles.KeyValue("gRPC Port", fmt.Sprintf("%d", grpcPort)))
+	lines = append(lines, "")
+	lines = append(lines, styles.Muted.Render("Note: Running in headless mode (no web UI)."))
+	lines = append(lines, styles.Muted.Render("Use the TUI or SDK to interact with the server."))
+	lines = append(lines, "")
+	lines = append(lines, styles.Muted.Render("To stop: hatchet server stop"))
+
+	return styles.SuccessBox.Render(strings.Join(lines, "\n"))
+}
+
 func init() {
 	rootCmd.AddCommand(serverCmd)
 
 	serverCmd.AddCommand(startCmd)
 	serverCmd.AddCommand(stopCmd)
 
-	// Add flags for server command
-	startCmd.Flags().IntP("dashboard-port", "d", 0, "Port for the Hatchet dashboard (default: auto-detect starting at 8888)")
+	// Flags for start command
+	// Local mode flags
+	startCmd.Flags().BoolP("local", "l", false, "Run without Docker (requires local PostgreSQL and hatchet binaries)")
+	startCmd.Flags().String("database-url", "", "PostgreSQL connection string for --local mode (default: postgresql://localhost:5432/hatchet)")
+	startCmd.Flags().Int("api-port", 0, "Port for the API server in --local mode (default: 8080)")
+	startCmd.Flags().Int("healthcheck-port", 0, "Port for the healthcheck server in --local mode (default: 8733)")
+
+	// Docker mode flags
+	startCmd.Flags().IntP("dashboard-port", "d", 0, "Port for the Hatchet dashboard in Docker mode (default: auto-detect starting at 8888)")
 	startCmd.Flags().IntP("grpc-port", "g", 0, "Port for the Hatchet gRPC server (default: auto-detect starting at 7077)")
 	startCmd.Flags().StringP("project-name", "p", "", "Docker project name for containers (default: hatchet-cli)")
+
+	// Common flags
 	startCmd.Flags().StringP("profile", "n", "local", "Name for the local profile (default: local)")
 
+	// Flags for stop command
+	stopCmd.Flags().BoolP("local", "l", false, "Explicitly stop a local (non-Docker) server")
 	stopCmd.Flags().StringP("project-name", "p", "", "Docker project name for containers (default: hatchet-cli)")
 }
