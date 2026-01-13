@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -140,9 +142,9 @@ func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, er
 	d.healthcheckPort = options.HealthcheckPort
 	d.profileName = options.ProfileName
 
-	// 1. Validate Postgres connection
-	if err := d.validatePostgres(ctx); err != nil {
-		return nil, fmt.Errorf("postgres not accessible: %w\n\nEnsure PostgreSQL is running and accessible at: %s", err, d.databaseURL)
+	// 1. Ensure database exists and is configured correctly
+	if err := d.ensureDatabase(ctx); err != nil {
+		return nil, fmt.Errorf("database setup failed: %w", err)
 	}
 
 	// 2. Initialize config directory
@@ -314,11 +316,72 @@ func (d *LocalDriver) IsRunning() bool {
 	return false
 }
 
-// validatePostgres checks if the database is accessible
-func (d *LocalDriver) validatePostgres(ctx context.Context) error {
+// ensureDatabase creates the database if needed and configures timezone
+func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
+	// Parse the database URL to extract database name
+	parsedURL, err := url.Parse(d.databaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid database URL: %w", err)
+	}
+
+	dbName := strings.TrimPrefix(parsedURL.Path, "/")
+	if dbName == "" {
+		dbName = "hatchet"
+	}
+
+	// Build connection URL for the default 'postgres' database
+	adminURL := *parsedURL
+	adminURL.Path = "/postgres"
+	adminConnStr := adminURL.String()
+
+	// Try to connect to the target database first
+	conn, err := pgx.Connect(ctx, d.databaseURL)
+	if err == nil {
+		// Database exists, just ensure timezone is set
+		conn.Close(ctx)
+		return d.ensureTimezone(ctx, dbName, adminConnStr)
+	}
+
+	// Database might not exist, try to create it
+	log.Printf("Creating database '%s'...", dbName)
+
+	adminConn, err := pgx.Connect(ctx, adminConnStr)
+	if err != nil {
+		return fmt.Errorf("could not connect to PostgreSQL: %w\n\nEnsure PostgreSQL is running and accessible", err)
+	}
+	defer adminConn.Close(ctx)
+
+	// Create database (ignore error if it already exists)
+	_, err = adminConn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", dbName))
+	if err != nil {
+		// Check if error is "database already exists" - that's fine
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("could not create database: %w", err)
+		}
+	}
+
+	// Set timezone to UTC
+	return d.ensureTimezone(ctx, dbName, adminConnStr)
+}
+
+// ensureTimezone sets the database timezone to UTC
+func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr string) error {
+	adminConn, err := pgx.Connect(ctx, adminConnStr)
+	if err != nil {
+		return fmt.Errorf("could not connect to PostgreSQL: %w", err)
+	}
+	defer adminConn.Close(ctx)
+
+	// Set timezone to UTC (required by Hatchet)
+	_, err = adminConn.Exec(ctx, fmt.Sprintf("ALTER DATABASE %s SET TIMEZONE='UTC'", dbName))
+	if err != nil {
+		return fmt.Errorf("could not set timezone: %w", err)
+	}
+
+	// Verify we can connect to the target database
 	conn, err := pgx.Connect(ctx, d.databaseURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not connect to database: %w", err)
 	}
 	defer conn.Close(ctx)
 

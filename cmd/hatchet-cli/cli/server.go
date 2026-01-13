@@ -23,21 +23,27 @@ var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start a local Hatchet server",
 	Long: `Start a local Hatchet server environment. By default, uses Docker containers.
-Use --local to run without Docker (runs in foreground, requires local PostgreSQL).`,
+
+Use --local to run without Docker:
+  - Runs API and engine in-process (single binary, no external deps)
+  - Headless mode (no web UI) - use TUI or SDK to interact
+  - Requires PostgreSQL running locally
+  - Auto-creates database and sets timezone if needed
+  - Runs in foreground, press Ctrl+C to stop`,
 	Example: `  # Start server with Docker (default)
   hatchet server start
 
-  # Start server without Docker (headless, runs in foreground)
+  # Start server without Docker (headless, in foreground)
   hatchet server start --local
 
-  # Start local server with custom database
+  # Start local server with custom database URL
   hatchet server start --local --database-url "postgresql://user:pass@localhost:5432/hatchet"
 
-  # Start Docker server with custom dashboard port
-  hatchet server start --dashboard-port 9000
+  # Start local server on custom ports (useful alongside Docker)
+  hatchet server start --local --api-port 9080 --grpc-port 9077
 
-  # Start server with custom profile name
-  hatchet server start --profile my-local`,
+  # Start Docker server with custom dashboard port
+  hatchet server start --dashboard-port 9000`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Check if --local flag is set
 		localMode, _ := cmd.Flags().GetBool("local")
