@@ -17,17 +17,14 @@ brew services start postgresql@17
 createdb hatchet
 psql hatchet -c "ALTER DATABASE hatchet SET TIMEZONE='UTC'"
 
-# 3. Build all required binaries
-go build -o bin/hatchet ./cmd/hatchet-cli && \
-go build -o bin/hatchet-api ./cmd/hatchet-api && \
-go build -o bin/hatchet-engine ./cmd/hatchet-engine && \
+# 3. Build the CLI
+go build -o bin/hatchet ./cmd/hatchet-cli
 export PATH="$PWD/bin:$PATH"
 
-# 4. Start the server
+# 4. Start the server (runs in foreground)
 hatchet server start --local
 
-# 5. (In another terminal) Start the TUI
-hatchet tui
+# Press Ctrl+C to stop
 ```
 
 ## Step-by-Step
@@ -56,13 +53,11 @@ psql postgres -c "GRANT ALL PRIVILEGES ON DATABASE hatchet TO hatchet;"
 psql hatchet -c "ALTER DATABASE hatchet SET TIMEZONE='UTC'"
 ```
 
-### 2. Build Binaries
+### 2. Build the CLI
 
 ```bash
-# Build all three required binaries
+# Build the hatchet CLI (includes API + engine in-process)
 go build -o bin/hatchet ./cmd/hatchet-cli
-go build -o bin/hatchet-api ./cmd/hatchet-api
-go build -o bin/hatchet-engine ./cmd/hatchet-engine
 
 # Add to PATH for current session
 export PATH="$PWD/bin:$PATH"
@@ -90,12 +85,14 @@ On first run, this will:
 - Generate encryption keys (stored in `~/.hatchet/local/`)
 - Run database migrations
 - Seed admin user (`admin@example.com` / `Admin123!!`)
-- Start `hatchet-api` on port 8080
-- Start `hatchet-engine`
+- Start API and engine in-process
 - Create a CLI profile named "local"
+
+**Note:** The server runs in foreground. Press Ctrl+C to stop.
 
 ### 4. Verify It's Running
 
+In another terminal:
 ```bash
 # Check API health
 curl http://localhost:8080/api/ready
@@ -104,26 +101,30 @@ curl http://localhost:8080/api/ready
 nc -zv localhost 7077
 
 # List profiles
-./bin/hatchet profile list
+hatchet profile list
 ```
 
 ### 5. Use the TUI
 
+In another terminal:
 ```bash
-./bin/hatchet tui
+hatchet tui
 ```
 
 ### 6. Stop the Server
 
+Press **Ctrl+C** in the terminal where the server is running.
+
+Alternatively, from another terminal:
 ```bash
-./bin/hatchet server stop
+hatchet server stop
 ```
 
 ## Configuration
 
 Config and state are stored in `~/.hatchet/local/`:
 - `keys.json` - Encryption keys (generated once, reused)
-- `state.json` - Running process PIDs
+- `state.json` - Running process info
 - `database.yaml` - Database config
 - `server.yaml` - Server config
 
@@ -146,13 +147,6 @@ psql hatchet -c "SELECT 1"
 psql hatchet -c "ALTER DATABASE hatchet SET TIMEZONE='UTC'"
 ```
 
-### "hatchet-api: command not found"
-```bash
-# Ensure binaries are built and in PATH
-export PATH="$PWD/bin:$PATH"
-which hatchet-api
-```
-
 ### Port already in use
 ```bash
 # Use different ports (e.g., if Docker Hatchet is running on defaults)
@@ -161,8 +155,7 @@ hatchet server start --local --api-port 9080 --grpc-port 9077 --healthcheck-port
 
 ### Reset everything
 ```bash
-# Stop server
-hatchet server stop
+# Stop server (Ctrl+C or hatchet server stop)
 
 # Drop and recreate database
 dropdb hatchet
@@ -184,7 +177,7 @@ Once the server is running, you can run workers against it:
 # Python example
 cd examples/python/quickstart
 poetry install
-export HATCHET_CLIENT_TOKEN=$(./bin/hatchet profile show -n local | grep Token | awk '{print $2}')
+export HATCHET_CLIENT_TOKEN=$(hatchet profile show -n local | grep Token | awk '{print $2}')
 export HATCHET_CLIENT_TLS_STRATEGY=none
 poetry run python worker.py
 ```
@@ -195,5 +188,7 @@ poetry run python worker.py
 |---------|-------------|------------|
 | Web UI | Yes (port 8888) | No (headless) |
 | PostgreSQL | Managed container | Your local instance |
-| Setup | Just Docker | Build binaries + Postgres |
+| Setup | Just Docker | Build CLI + Postgres |
+| Process | Background containers | Foreground process |
+| Stop | `hatchet server stop` | Ctrl+C |
 | Ports | 8888 (dashboard), 7077 (gRPC) | 8080 (API), 7077 (gRPC) |

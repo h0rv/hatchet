@@ -4,17 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/hatchet-dev/hatchet/cmd/hatchet-admin/cli/seed"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-api/api"
+	"github.com/hatchet-dev/hatchet/cmd/hatchet-engine/engine"
 	"github.com/hatchet-dev/hatchet/cmd/hatchet-migrate/migrate"
 	cliconfig "github.com/hatchet-dev/hatchet/pkg/config/cli"
 	"github.com/hatchet-dev/hatchet/pkg/config/loader"
@@ -29,7 +32,7 @@ const (
 	KeysFileName           = "keys.json"
 )
 
-// LocalDriver manages a local Hatchet server without Docker
+// LocalDriver manages a local Hatchet server running in-process
 type LocalDriver struct {
 	configDir       string
 	databaseURL     string
@@ -43,18 +46,13 @@ type LocalDriver struct {
 	privateJWT    string
 	publicJWT     string
 	cookieSecrets string
-
-	// Running processes
-	apiProcess    *exec.Cmd
-	engineProcess *exec.Cmd
 }
 
 // LocalServerState persists the state of a running local server
 type LocalServerState struct {
 	ConfigDir   string    `json:"config_dir"`
 	DatabaseURL string    `json:"database_url"`
-	ApiPID      int       `json:"api_pid"`
-	EnginePID   int       `json:"engine_pid"`
+	PID         int       `json:"pid"` // PID of the CLI process running the server
 	ApiPort     int       `json:"api_port"`
 	GrpcPort    int       `json:"grpc_port"`
 	ProfileName string    `json:"profile_name"`
@@ -120,7 +118,8 @@ func NewLocalDriver() *LocalDriver {
 	}
 }
 
-// Run starts the local Hatchet server
+// Run starts the local Hatchet server in-process (foreground mode)
+// This method blocks until the server is stopped via interrupt signal
 func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, error) {
 	// Apply options
 	// Default DB URL works with Mac Homebrew Postgres (current user, no password)
@@ -171,34 +170,13 @@ func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, er
 		return nil, fmt.Errorf("failed to seed database: %w", err)
 	}
 
-	// 7. Start API server
-	if err := d.startAPI(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start API server: %w", err)
-	}
-
-	// 8. Start Engine
-	if err := d.startEngine(ctx); err != nil {
-		// Clean up API if engine fails to start
-		d.killProcess(d.apiProcess)
-		return nil, fmt.Errorf("failed to start engine: %w", err)
-	}
-
-	// 9. Wait for health
-	if err := d.waitForHealth(ctx); err != nil {
-		d.killProcess(d.apiProcess)
-		d.killProcess(d.engineProcess)
-		return nil, fmt.Errorf("server failed to become healthy: %w", err)
-	}
-
-	// 10. Generate API token
+	// 7. Generate API token before starting server
 	token, err := d.generateToken(ctx)
 	if err != nil {
-		d.killProcess(d.apiProcess)
-		d.killProcess(d.engineProcess)
 		return nil, fmt.Errorf("failed to generate API token: %w", err)
 	}
 
-	// 11. Save state for stop command
+	// 8. Save state for stop command (PID of this process)
 	if err := d.saveState(); err != nil {
 		return nil, fmt.Errorf("failed to save state: %w", err)
 	}
@@ -209,6 +187,84 @@ func (d *LocalDriver) Run(ctx context.Context, opts ...LocalOpt) (*RunResult, er
 		APIPort:     d.apiPort,
 		GRPCPort:    d.grpcPort,
 	}, nil
+}
+
+// StartServer starts the API and engine in-process and blocks until interrupted
+// This should be called after Run() to actually start the server
+func (d *LocalDriver) StartServer(ctx context.Context, interruptCh <-chan interface{}, onReady func()) error {
+	// Set environment variables for the server
+	d.setEnvVars()
+
+	// Create config loader
+	cf := loader.NewConfigLoader(d.configDir)
+
+	// Track errors from goroutines
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	// Start API in goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := api.Start(cf, interruptCh, "local"); err != nil {
+			log.Printf("API error: %v", err)
+			errCh <- fmt.Errorf("API server error: %w", err)
+		}
+	}()
+
+	// Start Engine in goroutine
+	engineCtx, engineCancel := context.WithCancel(ctx)
+	defer engineCancel()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := engine.Run(engineCtx, cf, "local"); err != nil {
+			log.Printf("Engine error: %v", err)
+			errCh <- fmt.Errorf("engine error: %w", err)
+		}
+	}()
+
+	// Wait for API to be ready
+	if err := d.waitForHealth(ctx); err != nil {
+		return fmt.Errorf("server failed to become healthy: %w", err)
+	}
+
+	// Signal that server is ready
+	if onReady != nil {
+		onReady()
+	}
+
+	// Wait for interrupt or error
+	select {
+	case <-interruptCh:
+		// Clean shutdown initiated
+		log.Println("cleaning up server config")
+	case err := <-errCh:
+		return err
+	}
+
+	// Cancel engine context to trigger shutdown
+	engineCancel()
+
+	// Wait for all goroutines to finish (with timeout)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean exit
+	case <-time.After(10 * time.Second):
+		log.Println("shutdown timeout, some goroutines may not have exited cleanly")
+	}
+
+	// Clean up state file
+	d.removeState()
+
+	return nil
 }
 
 // RunResult contains the result of starting a local server
@@ -226,31 +282,15 @@ func (d *LocalDriver) Stop() error {
 		return fmt.Errorf("no local server running or state file not found: %w", err)
 	}
 
-	var errs []error
-
-	// Kill API process
-	if state.ApiPID > 0 {
-		if err := killProcessByPID(state.ApiPID); err != nil {
-			errs = append(errs, fmt.Errorf("failed to kill API process (PID %d): %w", state.ApiPID, err))
-		}
-	}
-
-	// Kill Engine process
-	if state.EnginePID > 0 {
-		if err := killProcessByPID(state.EnginePID); err != nil {
-			errs = append(errs, fmt.Errorf("failed to kill engine process (PID %d): %w", state.EnginePID, err))
+	// Send SIGTERM to the process
+	if state.PID > 0 {
+		if err := killProcessByPID(state.PID); err != nil {
+			return fmt.Errorf("failed to stop server (PID %d): %w", state.PID, err)
 		}
 	}
 
 	// Remove state file
-	stateFile := filepath.Join(d.configDir, StateFileName)
-	if err := os.Remove(stateFile); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("failed to remove state file: %w", err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during shutdown: %v", errs)
-	}
+	d.removeState()
 
 	return nil
 }
@@ -262,9 +302,9 @@ func (d *LocalDriver) IsRunning() bool {
 		return false
 	}
 
-	// Check if processes are actually running
-	if state.ApiPID > 0 {
-		if process, err := os.FindProcess(state.ApiPID); err == nil {
+	// Check if process is actually running
+	if state.PID > 0 {
+		if process, err := os.FindProcess(state.PID); err == nil {
 			if err := process.Signal(syscall.Signal(0)); err == nil {
 				return true
 			}
@@ -350,69 +390,25 @@ func (d *LocalDriver) generateToken(ctx context.Context) (string, error) {
 	return token.Token, nil
 }
 
-// startAPI starts the hatchet-api process
-func (d *LocalDriver) startAPI(ctx context.Context) error {
-	cmd := exec.Command("hatchet-api", "--config", d.configDir)
-	cmd.Env = d.buildEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Set process group for clean shutdown (Unix only)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start hatchet-api: %w\n\nEnsure 'hatchet-api' binary is in your PATH", err)
-	}
-
-	d.apiProcess = cmd
-	return nil
-}
-
-// startEngine starts the hatchet-engine process
-func (d *LocalDriver) startEngine(ctx context.Context) error {
-	cmd := exec.Command("hatchet-engine", "--config", d.configDir)
-	cmd.Env = d.buildEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Set process group for clean shutdown (Unix only)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start hatchet-engine: %w\n\nEnsure 'hatchet-engine' binary is in your PATH", err)
-	}
-
-	d.engineProcess = cmd
-	return nil
-}
-
-// buildEnv builds the environment variables for the server processes
-func (d *LocalDriver) buildEnv() []string {
-	// Start with current environment
-	env := os.Environ()
-
-	// Add Hatchet-specific variables
-	hatchetEnv := []string{
-		"DATABASE_URL=" + d.databaseURL,
-		"SERVER_AUTH_COOKIE_DOMAIN=localhost",
-		"SERVER_AUTH_COOKIE_INSECURE=t",
-		"SERVER_AUTH_COOKIE_SECRETS=" + d.cookieSecrets,
-		"SERVER_GRPC_BIND_ADDRESS=0.0.0.0",
-		"SERVER_GRPC_INSECURE=t",
-		"SERVER_GRPC_PORT=" + strconv.Itoa(d.grpcPort),
-		"SERVER_GRPC_BROADCAST_ADDRESS=localhost:" + strconv.Itoa(d.grpcPort),
-		"SERVER_URL=http://localhost:" + strconv.Itoa(d.apiPort),
-		"SERVER_PORT=" + strconv.Itoa(d.apiPort),
-		"SERVER_HEALTHCHECK_PORT=" + strconv.Itoa(d.healthcheckPort),
-		"SERVER_AUTH_SET_EMAIL_VERIFIED=t",
-		"SERVER_ENCRYPTION_MASTER_KEYSET=" + d.masterKey,
-		"SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET=" + d.privateJWT,
-		"SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET=" + d.publicJWT,
-		"SERVER_MSGQUEUE_KIND=postgres",
-		"SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS=localhost:" + strconv.Itoa(d.grpcPort),
-	}
-
-	return append(env, hatchetEnv...)
+// setEnvVars sets environment variables for the in-process server
+func (d *LocalDriver) setEnvVars() {
+	os.Setenv("DATABASE_URL", d.databaseURL)
+	os.Setenv("SERVER_AUTH_COOKIE_DOMAIN", "localhost")
+	os.Setenv("SERVER_AUTH_COOKIE_INSECURE", "t")
+	os.Setenv("SERVER_AUTH_COOKIE_SECRETS", d.cookieSecrets)
+	os.Setenv("SERVER_GRPC_BIND_ADDRESS", "0.0.0.0")
+	os.Setenv("SERVER_GRPC_INSECURE", "t")
+	os.Setenv("SERVER_GRPC_PORT", strconv.Itoa(d.grpcPort))
+	os.Setenv("SERVER_GRPC_BROADCAST_ADDRESS", fmt.Sprintf("localhost:%d", d.grpcPort))
+	os.Setenv("SERVER_URL", fmt.Sprintf("http://localhost:%d", d.apiPort))
+	os.Setenv("SERVER_PORT", strconv.Itoa(d.apiPort))
+	os.Setenv("SERVER_HEALTHCHECK_PORT", strconv.Itoa(d.healthcheckPort))
+	os.Setenv("SERVER_AUTH_SET_EMAIL_VERIFIED", "t")
+	os.Setenv("SERVER_ENCRYPTION_MASTER_KEYSET", d.masterKey)
+	os.Setenv("SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET", d.privateJWT)
+	os.Setenv("SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET", d.publicJWT)
+	os.Setenv("SERVER_MSGQUEUE_KIND", "postgres")
+	os.Setenv("SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS", fmt.Sprintf("localhost:%d", d.grpcPort))
 }
 
 // waitForHealth waits for the API server to become healthy
@@ -446,8 +442,7 @@ func (d *LocalDriver) saveState() error {
 	state := LocalServerState{
 		ConfigDir:   d.configDir,
 		DatabaseURL: d.databaseURL,
-		ApiPID:      d.apiProcess.Process.Pid,
-		EnginePID:   d.engineProcess.Process.Pid,
+		PID:         os.Getpid(), // Current process PID (in-process server)
 		ApiPort:     d.apiPort,
 		GrpcPort:    d.grpcPort,
 		ProfileName: d.profileName,
@@ -480,12 +475,10 @@ func (d *LocalDriver) loadState() (*LocalServerState, error) {
 	return &state, nil
 }
 
-// killProcess gracefully kills a process
-func (d *LocalDriver) killProcess(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	killProcessByPID(cmd.Process.Pid)
+// removeState removes the state file
+func (d *LocalDriver) removeState() {
+	stateFile := filepath.Join(d.configDir, StateFileName)
+	os.Remove(stateFile)
 }
 
 // killProcessByPID kills a process by PID with graceful shutdown
@@ -504,7 +497,7 @@ func killProcessByPID(pid int) error {
 		return err
 	}
 
-	// Wait up to 3 seconds for graceful shutdown
+	// Wait up to 5 seconds for graceful shutdown
 	done := make(chan error, 1)
 	go func() {
 		_, err := process.Wait()
@@ -514,7 +507,7 @@ func killProcessByPID(pid int) error {
 	select {
 	case <-done:
 		return nil
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		// Force kill
 		return process.Kill()
 	}
