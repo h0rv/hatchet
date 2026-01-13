@@ -128,7 +128,7 @@ func (d *LocalDriver) writeDatabaseConfig() error {
 			AdminName:         "Admin",
 			DefaultTenantName: "Default",
 			DefaultTenantSlug: "default",
-			DefaultTenantID:   "707d0855-80ab-4e1f-a156-f1c4546cbf52",
+			DefaultTenantID:   DefaultTenantID, // Use constant defined in local.go
 		},
 	}
 

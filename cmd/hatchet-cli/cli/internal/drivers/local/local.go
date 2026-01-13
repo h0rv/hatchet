@@ -329,7 +329,14 @@ func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
 		dbName = "hatchet"
 	}
 
+	// Validate database name to prevent SQL injection
+	// Only allow alphanumeric characters and underscores
+	if !isValidIdentifier(dbName) {
+		return fmt.Errorf("invalid database name: %s (only alphanumeric and underscores allowed)", dbName)
+	}
+
 	// Build connection URL for the default 'postgres' database
+	// Preserve query params (like sslmode) from original URL
 	adminURL := *parsedURL
 	adminURL.Path = "/postgres"
 	adminConnStr := adminURL.String()
@@ -352,7 +359,8 @@ func (d *LocalDriver) ensureDatabase(ctx context.Context) error {
 	defer adminConn.Close(ctx)
 
 	// Create database (ignore error if it already exists)
-	_, err = adminConn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", dbName))
+	// Using quoted identifier to safely handle the database name
+	_, err = adminConn.Exec(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, dbName))
 	if err != nil {
 		// Check if error is "database already exists" - that's fine
 		if !strings.Contains(err.Error(), "already exists") {
@@ -373,7 +381,8 @@ func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr s
 	defer adminConn.Close(ctx)
 
 	// Set timezone to UTC (required by Hatchet)
-	_, err = adminConn.Exec(ctx, fmt.Sprintf("ALTER DATABASE %s SET TIMEZONE='UTC'", dbName))
+	// Using quoted identifier to safely handle the database name
+	_, err = adminConn.Exec(ctx, fmt.Sprintf(`ALTER DATABASE "%s" SET TIMEZONE='UTC'`, dbName))
 	if err != nil {
 		return fmt.Errorf("could not set timezone: %w", err)
 	}
@@ -386,6 +395,23 @@ func (d *LocalDriver) ensureTimezone(ctx context.Context, dbName, adminConnStr s
 	defer conn.Close(ctx)
 
 	return conn.Ping(ctx)
+}
+
+// isValidIdentifier checks if a string is a valid PostgreSQL identifier
+// Only allows alphanumeric characters and underscores
+func isValidIdentifier(s string) bool {
+	if len(s) == 0 || len(s) > 63 {
+		return false
+	}
+	for i, c := range s {
+		if i == 0 && c >= '0' && c <= '9' {
+			return false // Can't start with a digit
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // initConfigDir creates the config directory if it doesn't exist
@@ -478,18 +504,29 @@ func (d *LocalDriver) setEnvVars() {
 func (d *LocalDriver) waitForHealth(ctx context.Context) error {
 	healthURL := fmt.Sprintf("http://localhost:%d/api/ready", d.apiPort)
 
-	timeout := time.After(30 * time.Second)
+	// Create a context with timeout for the entire health check operation
+	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	client := &http.Client{Timeout: 2 * time.Second}
+
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeout:
+		case <-healthCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("timeout waiting for server to become healthy")
 		case <-ticker.C:
-			resp, err := http.Get(healthURL)
+			// Use context-aware request to properly cancel on shutdown
+			req, err := http.NewRequestWithContext(healthCtx, "GET", healthURL, nil)
+			if err != nil {
+				continue
+			}
+			resp, err := client.Do(req)
 			if err == nil {
 				resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -541,7 +578,9 @@ func (d *LocalDriver) loadState() (*LocalServerState, error) {
 // removeState removes the state file
 func (d *LocalDriver) removeState() {
 	stateFile := filepath.Join(d.configDir, StateFileName)
-	os.Remove(stateFile)
+	if err := os.Remove(stateFile); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to remove state file: %v", err)
+	}
 }
 
 // killProcessByPID kills a process by PID with graceful shutdown
